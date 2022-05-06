@@ -21,6 +21,7 @@ using System.Text.RegularExpressions;
 using BBDown.Core;
 using BBDown.Core.Util;
 using BBDown.Core.Fetcher;
+using Fleck;
 
 namespace BBDown
 {
@@ -98,9 +99,33 @@ namespace BBDown
             public bool OnlyAv1 { get; set; }
             public bool AddDfnSubfix { get; set; }
             public bool NoPaddingPageNum { get; set; }
+            //
+            public long FeedbackQQ { get; set; }
         }
 
-        public static async Task<int> Main(params string[] args)
+        class WebsocketRequest
+        {
+            public string QQ { get; set; }
+
+            public string[] Args { get; set; }
+        }
+
+        class WebsocketResponse
+        {
+            public string QQ { get; set; }
+
+            public int Status { get; set; }
+
+            public string Aid { get; set; }
+
+            public string Title { get; set; }
+
+            public int VideoCount { get; set; }
+        }
+
+        private static List<IWebSocketConnection> AllSockets = new List<IWebSocketConnection>();
+
+        public static async Task Main(params string[] args)
         {
             ServicePointManager.DefaultConnectionLimit = 2048;
 
@@ -259,29 +284,14 @@ namespace BBDown
                 {
                     IsHidden = true
                 },
+                //
+                new Option<long>(
+                    new string[]{ "--FeedbackQQ"},
+                    "设置反馈QQ")
+                {
+                    IsHidden = true
+                },
             };
-
-            Command loginCommand = new Command(
-                "login",
-                "通过APP扫描二维码以登录您的WEB账号");
-            rootCommand.AddCommand(loginCommand);
-            Command loginTVCommand = new Command(
-                "logintv",
-                "通过APP扫描二维码以登录您的TV账号");
-            rootCommand.AddCommand(loginTVCommand);
-            rootCommand.Description = "BBDown是一个免费且便捷高效的哔哩哔哩下载/解析软件.";
-            rootCommand.TreatUnmatchedTokensAsErrors = true;
-
-            //WEB登录
-            loginCommand.Handler = CommandHandler.Create(loginWEB);
-
-            //TV登录
-            loginTVCommand.Handler = CommandHandler.Create(loginTV);
-
-            rootCommand.Handler = CommandHandler.Create<MyOption>(async (myOption) =>
-            {
-                await DoWorkAsync(myOption);
-            });
 
             Console.BackgroundColor = ConsoleColor.DarkBlue;
             Console.ForegroundColor = ConsoleColor.White;
@@ -292,43 +302,91 @@ namespace BBDown
                 "https://github.com/nilaoda/BBDown/discussions\r\n");
             Console.WriteLine();
 
-            //处理配置文件
-            var myArgs = new List<string>(Environment.GetCommandLineArgs());
-            try
+            rootCommand.Handler = CommandHandler.Create<MyOption>(async (myOption) =>
             {
-                var configPath = "";
-                if (myArgs.Contains("--config-file"))
-                {
-                    configPath = myArgs.ElementAt(myArgs.IndexOf("--config-file") + 1);
-                }
-                else
-                {
-                    configPath = Path.Combine(APP_DIR, "BBDown.config");
-                }
+                await DoWorkAsync(myOption);
+            });
 
-                if (File.Exists(configPath))
-                {
-                    Log($"加载配置文件: {configPath}");
-                    var configArgs = File.ReadAllLines(configPath).Where(s => !string.IsNullOrEmpty(s) && !s.StartsWith("#")).Select(s => s.Trim().Trim('\"'));
-                    LogDebug(string.Join(" ", configArgs));
-                    myArgs.AddRange(configArgs);
-                }
-            }
-            catch (Exception)
+            var server = new WebSocketServer("ws://0.0.0.0:58181");
+            server.Start(socket =>
             {
-                LogError("配置文件读取异常，忽略");
-            }
+                socket.OnOpen = () =>
+                {
+                    Console.WriteLine("WebSocket Connect!");
+                    AllSockets.Add(socket);
+                };
+                socket.OnClose = () =>
+                {
+                    Console.WriteLine("WebSocket Close!");
+                    AllSockets.Remove(socket);
+                };
+                socket.OnMessage = async message =>
+                {
+                    await socket.Send(message);
+                    try
+                    {
+                        WebsocketRequest info = JsonSerializer.Deserialize<WebsocketRequest>(message);
+                        //Log("qq = " + info.qq);
+                        //Log(string.Join(",", info.args));
 
-            return await rootCommand.InvokeAsync(myArgs.ToArray());
+                        //处理配置文件
+                        var myArgs = new List<string>(info.Args);
+                        myArgs.Add("--FeedbackQQ");
+                        myArgs.Add(info.QQ);
+                        Log("-------------------------------------------------------------------------------");
+                        Log("参数: " + string.Join(",", myArgs));
+
+                        try
+                        {
+                            var configPath = "";
+                            if (myArgs.Contains("--config-file"))
+                            {
+                                configPath = myArgs.ElementAt(myArgs.IndexOf("--config-file") + 1);
+                            }
+                            else
+                            {
+                                configPath = Path.Combine(APP_DIR, "BBDown.config");
+                            }
+
+                            if (File.Exists(configPath))
+                            {
+                                Log($"加载配置文件: {configPath}");
+                                var configArgs = File.ReadAllLines(configPath).Where(s => !string.IsNullOrEmpty(s) && !s.StartsWith("#")).Select(s => s.Trim().Trim('\"'));
+                                LogDebug(string.Join(" ", configArgs));
+                                myArgs.AddRange(configArgs);
+                            }
+                        }
+                        catch (Exception)
+                        {
+                            LogError("配置文件读取异常，忽略");
+                        }
+
+                        await rootCommand.InvokeAsync(myArgs.ToArray());
+                    }
+                    catch (Exception e)
+                    {
+                        LogError("消息解析失败: " + message + "\n错误是: " + e);
+                    }
+                };
+            });
+
+            var input = Console.ReadLine();
+            while (input != "exit")
+            {
+                input = Console.ReadLine();
+            }
         }
 
         private static async Task DoWorkAsync(MyOption myOption)
         {
             //检测更新
-            new Thread(async () =>
-            {
-                await CheckUpdateAsync();
-            }).Start();
+            //new Thread(async () =>
+            //{
+            //    await CheckUpdateAsync();
+            //}).Start();
+            WebsocketResponse wsResponse = new WebsocketResponse();
+            wsResponse.QQ = myOption.FeedbackQQ.ToString();
+            wsResponse.Status = 0;
             try
             {
                 //兼容旧版本命令行参数并给出警告
@@ -590,6 +648,9 @@ namespace BBDown
                 bool more = false;
                 bool bangumi = vInfo.IsBangumi;
                 bool cheese = vInfo.IsCheese;
+                //
+                wsResponse.Aid = aidOri;
+                wsResponse.Title = vInfo.Title;
 
                 //打印分P信息
                 foreach (Page p in pagesInfo)
@@ -627,7 +688,12 @@ namespace BBDown
                 Log($"共计 {pagesInfo.Count} 个分P, 已选择：" + (selectedPages == null ? "ALL" : string.Join(",", selectedPages)));
                 var pagesCount = pagesInfo.Count;
 
-                //过滤不需要的分P
+                //
+                wsResponse.Status = 1;
+                wsResponse.VideoCount = pagesInfo.Count;
+                AllSockets.ToList().ForEach(s => s.Send(JsonSerializer.Serialize(wsResponse)));
+
+                //过滤不需要的分P              
                 if (selectedPages != null)
                     pagesInfo = pagesInfo.Where(p => selectedPages.Contains(p.index.ToString())).ToList();
 
@@ -1057,6 +1123,8 @@ namespace BBDown
                     }
                 }
                 Log("任务完成");
+                wsResponse.Status = 2;
+                AllSockets.ToList().ForEach(s => s.Send(JsonSerializer.Serialize(wsResponse)));
             }
             catch (Exception e)
             {
@@ -1065,6 +1133,8 @@ namespace BBDown
                 Console.Write(Config.DEBUG_LOG ? e.ToString() : e.Message);
                 Console.ResetColor();
                 Console.WriteLine();
+                wsResponse.Status = -1;
+                AllSockets.ToList().ForEach(s => s.Send(JsonSerializer.Serialize(wsResponse)));
                 Thread.Sleep(1);
             }
         }
